@@ -512,16 +512,59 @@ export default function AppReporting() {
   // Run Comparison (client-side: fetches both datasets and joins them)
   // -------------------------------------------------------------------------
   const fetchAllRecords = async (entityName) => {
-    // Fetch records, handling both array and wrapped response shapes
-    try {
-      const result = await base44.entities[entityName].list();
+    // Base44 caps .list() at ~5000 records per call, so we paginate
+    const PAGE_SIZE = 5000;
+    const allRecords = [];
+    let page = 0;
+    let keepGoing = true;
+
+    const extractArray = (result) => {
       if (Array.isArray(result)) return result;
       if (result?.data && Array.isArray(result.data)) return result.data;
       if (result?.items && Array.isArray(result.items)) return result.items;
       return [];
+    };
+
+    try {
+      while (keepGoing) {
+        const offset = page * PAGE_SIZE;
+        let batch = [];
+
+        try {
+          // Try paginated call: list(filter, limit, offset)
+          const result = await base44.entities[entityName].list("", PAGE_SIZE, offset);
+          batch = extractArray(result);
+        } catch (paginatedErr) {
+          if (page === 0) {
+            // First page failed with pagination args — try without args
+            console.warn(`Paginated list() failed for ${entityName}, trying without args:`, paginatedErr.message);
+            const result = await base44.entities[entityName].list();
+            batch = extractArray(result);
+            // Can't paginate, so take what we got and stop
+            allRecords.push(...batch);
+            break;
+          } else {
+            // Later page failed — we've likely fetched everything
+            break;
+          }
+        }
+
+        allRecords.push(...batch);
+        console.log(`${entityName}: fetched page ${page + 1} (${batch.length} records, ${allRecords.length} total)`);
+
+        // If we got fewer than PAGE_SIZE, we've reached the end
+        if (batch.length < PAGE_SIZE) {
+          keepGoing = false;
+        } else {
+          page++;
+        }
+      }
+
+      return allRecords;
     } catch (err) {
       console.error(`Failed to fetch ${entityName}:`, err);
-      return [];
+      // Return whatever we collected so far
+      return allRecords;
     }
   };
 
