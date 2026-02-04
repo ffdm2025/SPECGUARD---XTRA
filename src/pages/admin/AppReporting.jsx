@@ -324,7 +324,8 @@ export default function AppReporting() {
   // Entity Comparison State
   const [leftEntity, setLeftEntity] = useState("");
   const [rightEntity, setRightEntity] = useState("");
-  const [joinField, setJoinField] = useState("");
+  const [leftJoinField, setLeftJoinField] = useState("");
+  const [rightJoinField, setRightJoinField] = useState("");
   const [availableFields, setAvailableFields] = useState({ left: [], right: [] });
   const [selectedFields, setSelectedFields] = useState({ left: [], right: [] });
   const [comparisonData, setComparisonData] = useState(null);
@@ -345,12 +346,19 @@ export default function AppReporting() {
     checkAccess();
   }, []);
 
-  // Reset selected fields when entities change
+  // Reset selected fields when left entity changes
   useEffect(() => {
-    setSelectedFields({ left: [], right: [] });
-    setJoinField("");
+    setSelectedFields((prev) => ({ ...prev, left: [] }));
+    setLeftJoinField("");
     setComparisonData(null);
-  }, [leftEntity, rightEntity]);
+  }, [leftEntity]);
+
+  // Reset selected fields when right entity changes
+  useEffect(() => {
+    setSelectedFields((prev) => ({ ...prev, right: [] }));
+    setRightJoinField("");
+    setComparisonData(null);
+  }, [rightEntity]);
 
   const checkAccess = async () => {
     try {
@@ -385,26 +393,78 @@ export default function AppReporting() {
   };
 
   // -------------------------------------------------------------------------
-  // Entity Schema Loading
+  // Entity Schema Loading (robust: tries multiple schema shapes + sample data)
   // -------------------------------------------------------------------------
+  const extractFieldsFromSchema = (obj) => {
+    if (!obj || typeof obj !== "object") return [];
+
+    // Direct properties at top level: { properties: { field: ... } }
+    if (obj.properties && typeof obj.properties === "object") {
+      return Object.keys(obj.properties);
+    }
+    // Wrapped in schema key: { schema: { properties: { ... } } }
+    if (obj.schema?.properties && typeof obj.schema.properties === "object") {
+      return Object.keys(obj.schema.properties);
+    }
+    // Array/items wrapper: { items: { properties: { ... } } }
+    if (obj.items?.properties && typeof obj.items.properties === "object") {
+      return Object.keys(obj.items.properties);
+    }
+    // Definitions wrapper: { definitions: { EntityName: { properties: { ... } } } }
+    if (obj.definitions && typeof obj.definitions === "object") {
+      const firstDef = Object.values(obj.definitions)[0];
+      if (firstDef?.properties) {
+        return Object.keys(firstDef.properties);
+      }
+    }
+    // If the object itself looks like a flat field map: { field1: { type: ... }, field2: ... }
+    const keys = Object.keys(obj);
+    if (keys.length > 0 && keys.every((k) => typeof obj[k] === "object" && obj[k] !== null)) {
+      const hasTypeKeys = keys.some((k) => obj[k].type || obj[k].enum || obj[k].format);
+      if (hasTypeKeys) return keys;
+    }
+
+    return [];
+  };
+
   const loadEntitySchema = async (entityName, side) => {
     try {
       let fields = [];
 
-      const schema = await base44.entities[entityName].schema();
-      if (schema?.properties) {
-        fields = Object.keys(schema.properties);
+      // Strategy 1: Try .schema()
+      try {
+        const schema = await base44.entities[entityName].schema();
+        console.log(`Schema response for ${entityName}:`, JSON.stringify(schema).slice(0, 500));
+        fields = extractFieldsFromSchema(schema);
+      } catch (schemaErr) {
+        console.warn(`schema() failed for ${entityName}:`, schemaErr.message);
       }
 
-      // Fallback: load a sample record to discover fields
+      // Strategy 2: Fall back to loading sample records
       if (fields.length === 0) {
-        const sampleData = await base44.entities[entityName].list("", 1);
-        if (sampleData.length > 0) {
-          fields = Object.keys(sampleData[0]);
+        console.log(`Falling back to sample data for ${entityName}`);
+        try {
+          const sampleData = await base44.entities[entityName].list("", 1);
+          const records = Array.isArray(sampleData) ? sampleData : sampleData?.data || sampleData?.items || [];
+          if (records.length > 0) {
+            fields = Object.keys(records[0]);
+          }
+        } catch (listErr) {
+          console.warn(`list() with ("", 1) failed for ${entityName}:`, listErr.message);
+          // Try without arguments or with different signature
+          try {
+            const sampleData2 = await base44.entities[entityName].list();
+            const records2 = Array.isArray(sampleData2) ? sampleData2 : sampleData2?.data || sampleData2?.items || [];
+            if (records2.length > 0) {
+              fields = Object.keys(records2[0]);
+            }
+          } catch (listErr2) {
+            console.warn(`list() with no args also failed for ${entityName}:`, listErr2.message);
+          }
         }
       }
 
-      // Include built-in fields
+      // Include built-in fields that might not appear in schema
       const builtInFields = ["id", "created_date", "updated_date", "created_by"];
       fields = [...new Set([...builtInFields, ...fields])];
 
@@ -413,7 +473,12 @@ export default function AppReporting() {
         [side]: fields,
       }));
 
-      toast.success(`Loaded ${fields.length} fields from ${entityName}`);
+      const schemaFieldCount = fields.length - builtInFields.length;
+      if (schemaFieldCount > 0) {
+        toast.success(`Loaded ${fields.length} fields from ${entityName} (${schemaFieldCount} entity fields + ${builtInFields.length} built-in)`);
+      } else {
+        toast.warning(`Only found built-in fields for ${entityName}. Schema may not be accessible — check console for details.`);
+      }
     } catch (error) {
       toast.error("Failed to load schema: " + error.message);
       console.error("Schema load error:", error);
@@ -444,20 +509,12 @@ export default function AppReporting() {
   };
 
   // -------------------------------------------------------------------------
-  // Determine common fields (valid join field candidates)
-  // -------------------------------------------------------------------------
-  const commonFields = useMemo(() => {
-    const leftSet = new Set(availableFields.left);
-    return availableFields.right.filter((f) => leftSet.has(f));
-  }, [availableFields]);
-
-  // -------------------------------------------------------------------------
   // Run Comparison
   // -------------------------------------------------------------------------
   const runComparison = async () => {
     const totalSelected = selectedFields.left.length + selectedFields.right.length;
-    if (!leftEntity || !rightEntity || !joinField || totalSelected === 0) {
-      toast.error("Please select entities, a join field, and at least one field to display");
+    if (!leftEntity || !rightEntity || !leftJoinField || !rightJoinField || totalSelected === 0) {
+      toast.error("Please select entities, join fields for both sides, and at least one display field");
       return;
     }
 
@@ -472,7 +529,9 @@ export default function AppReporting() {
       const response = await base44.functions.invoke("compareEntities", {
         leftEntity,
         rightEntity,
-        joinField,
+        joinField: leftJoinField,
+        leftJoinField,
+        rightJoinField,
         selectedFields: fieldPayload,
       });
       setComparisonData(response.data);
@@ -673,29 +732,58 @@ export default function AppReporting() {
                   </div>
                 </div>
 
-                {/* Join Field */}
-                <div>
-                  <label className="text-sm font-medium mb-2 block">
-                    Join Field (PKID &mdash; must exist in both entities)
+                {/* Join Fields (one from each side) */}
+                <div className="border rounded-lg p-4 bg-gray-50 space-y-3">
+                  <label className="text-sm font-semibold block">
+                    Join Fields (PKID) &mdash; select the key field from each entity to match records
                   </label>
-                  {commonFields.length > 0 ? (
-                    <Select value={joinField} onValueChange={setJoinField}>
-                      <SelectTrigger>
-                        <SelectValue placeholder="Select the shared key field (e.g. asset_id)" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {commonFields.map((field) => (
-                          <SelectItem key={field} value={field}>
-                            {field}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  ) : (
-                    <p className="text-sm text-gray-500 italic">
-                      {leftEntity && rightEntity
-                        ? "No common fields found between the two entities. Select entities that share a field."
-                        : "Select both entities to see available join fields."}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-xs text-gray-500 mb-1 block">
+                        Left key ({leftEntity || "..."})
+                      </label>
+                      {leftEntity && availableFields.left.length > 0 ? (
+                        <Select value={leftJoinField} onValueChange={setLeftJoinField}>
+                          <SelectTrigger>
+                            <SelectValue placeholder="Select left join field" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {availableFields.left.map((field) => (
+                              <SelectItem key={field} value={field}>
+                                {field}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      ) : (
+                        <p className="text-sm text-gray-400 italic">Select a left entity first</p>
+                      )}
+                    </div>
+                    <div>
+                      <label className="text-xs text-gray-500 mb-1 block">
+                        Right key ({rightEntity || "..."})
+                      </label>
+                      {rightEntity && availableFields.right.length > 0 ? (
+                        <Select value={rightJoinField} onValueChange={setRightJoinField}>
+                          <SelectTrigger>
+                            <SelectValue placeholder="Select right join field" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {availableFields.right.map((field) => (
+                              <SelectItem key={field} value={field}>
+                                {field}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      ) : (
+                        <p className="text-sm text-gray-400 italic">Select a right entity first</p>
+                      )}
+                    </div>
+                  </div>
+                  {leftJoinField && rightJoinField && (
+                    <p className="text-xs text-green-700">
+                      Join: <strong>{leftEntity}.{leftJoinField}</strong> = <strong>{rightEntity}.{rightJoinField}</strong>
                     </p>
                   )}
                 </div>
@@ -708,9 +796,9 @@ export default function AppReporting() {
                     <Badge variant="outline">{leftEntity || "?"}</Badge>,{" "}
                     {selectedFields.right.length} field(s) from{" "}
                     <Badge variant="outline">{rightEntity || "?"}</Badge>
-                    {joinField && (
+                    {leftJoinField && rightJoinField && (
                       <>
-                        , joined on <Badge>{joinField}</Badge>
+                        , joined on <Badge>{leftEntity}.{leftJoinField}</Badge> = <Badge>{rightEntity}.{rightJoinField}</Badge>
                       </>
                     )}
                   </div>
@@ -724,7 +812,8 @@ export default function AppReporting() {
                       comparisonLoading ||
                       !leftEntity ||
                       !rightEntity ||
-                      !joinField ||
+                      !leftJoinField ||
+                      !rightJoinField ||
                       (selectedFields.left.length + selectedFields.right.length === 0)
                     }
                   >
