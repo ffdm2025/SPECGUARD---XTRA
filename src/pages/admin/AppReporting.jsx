@@ -509,8 +509,22 @@ export default function AppReporting() {
   };
 
   // -------------------------------------------------------------------------
-  // Run Comparison
+  // Run Comparison (client-side: fetches both datasets and joins them)
   // -------------------------------------------------------------------------
+  const fetchAllRecords = async (entityName) => {
+    // Fetch records, handling both array and wrapped response shapes
+    try {
+      const result = await base44.entities[entityName].list();
+      if (Array.isArray(result)) return result;
+      if (result?.data && Array.isArray(result.data)) return result.data;
+      if (result?.items && Array.isArray(result.items)) return result.items;
+      return [];
+    } catch (err) {
+      console.error(`Failed to fetch ${entityName}:`, err);
+      return [];
+    }
+  };
+
   const runComparison = async () => {
     const totalSelected = selectedFields.left.length + selectedFields.right.length;
     if (!leftEntity || !rightEntity || !leftJoinField || !rightJoinField || totalSelected === 0) {
@@ -520,24 +534,88 @@ export default function AppReporting() {
 
     setComparisonLoading(true);
     try {
-      // Build the selectedFields payload in the format the backend expects
-      const fieldPayload = [
-        ...selectedFields.left.map((f) => ({ entity: leftEntity, field: f })),
-        ...selectedFields.right.map((f) => ({ entity: rightEntity, field: f })),
-      ];
+      // Fetch both datasets
+      const [leftRecords, rightRecords] = await Promise.all([
+        fetchAllRecords(leftEntity),
+        fetchAllRecords(rightEntity),
+      ]);
 
-      const response = await base44.functions.invoke("compareEntities", {
-        leftEntity,
-        rightEntity,
-        joinField: leftJoinField,
-        leftJoinField,
-        rightJoinField,
-        selectedFields: fieldPayload,
-      });
-      setComparisonData(response.data);
-      toast.success(`Comparison complete: ${response.data.summary.total_matched} matches`);
+      toast.info(`Fetched ${leftRecords.length} ${leftEntity} + ${rightRecords.length} ${rightEntity} records. Joining...`);
+
+      // Build a lookup map from the right entity keyed by the right join field
+      const rightMap = new Map();
+      for (const record of rightRecords) {
+        const key = String(record[rightJoinField] ?? "").trim().toLowerCase();
+        if (key) {
+          // Store all matching right records (handles duplicates)
+          if (!rightMap.has(key)) {
+            rightMap.set(key, []);
+          }
+          rightMap.get(key).push(record);
+        }
+      }
+
+      // Determine which fields to include, prefixed by entity name to avoid collisions
+      const leftFields = selectedFields.left;
+      const rightFields = selectedFields.right;
+
+      // Join: for each left record, find matching right records
+      const joinedRows = [];
+      let matchCount = 0;
+
+      for (const leftRec of leftRecords) {
+        const key = String(leftRec[leftJoinField] ?? "").trim().toLowerCase();
+        const rightMatches = rightMap.get(key);
+
+        if (rightMatches && rightMatches.length > 0) {
+          matchCount++;
+          for (const rightRec of rightMatches) {
+            const row = {};
+            // Add join key first
+            row[`${leftJoinField}`] = leftRec[leftJoinField];
+            // Add left fields
+            for (const f of leftFields) {
+              const label = leftEntity === rightEntity ? `L.${f}` : `${leftEntity}.${f}`;
+              row[label] = leftRec[f];
+            }
+            // Add right fields
+            for (const f of rightFields) {
+              const label = leftEntity === rightEntity ? `R.${f}` : `${rightEntity}.${f}`;
+              row[label] = rightRec[f];
+            }
+            joinedRows.push(row);
+          }
+        } else {
+          // Unmatched left record — include with empty right columns
+          const row = {};
+          row[`${leftJoinField}`] = leftRec[leftJoinField];
+          for (const f of leftFields) {
+            const label = leftEntity === rightEntity ? `L.${f}` : `${leftEntity}.${f}`;
+            row[label] = leftRec[f];
+          }
+          for (const f of rightFields) {
+            const label = leftEntity === rightEntity ? `R.${f}` : `${rightEntity}.${f}`;
+            row[label] = null;
+          }
+          joinedRows.push(row);
+        }
+      }
+
+      const summary = {
+        total_left_records: leftRecords.length,
+        total_right_records: rightRecords.length,
+        total_matched: matchCount,
+        match_rate:
+          leftRecords.length > 0
+            ? ((matchCount / leftRecords.length) * 100).toFixed(1) + "%"
+            : "N/A",
+      };
+
+      setComparisonData({ summary, data: joinedRows });
+      toast.success(`Comparison complete: ${matchCount} matched out of ${leftRecords.length} left records (${joinedRows.length} total rows)`);
     } catch (error) {
       toast.error("Comparison failed: " + error.message);
+      console.error("Comparison error:", error);
     } finally {
       setComparisonLoading(false);
     }
